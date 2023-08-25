@@ -1,20 +1,29 @@
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext,CallbackQueryHandler,MessageHandler,filters
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup,ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 import logging
+from bson.objectid import ObjectId
 from datetime import datetime, timedelta
 import asyncio
+import uuid
 from db import db, REMINDER_COLLECTION
 from token_1 import Token
+from pytz import timezone
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 
 SELECT_REMINDER_TIME = range(1)
-ENTER_REMINDER_TEXT, ENTER_REMINDER_TIME, SELECT_REMINDER_TIME, SELECT_CUSTOM_TIME_OPTION, ENTER_CUSTOM_TIME = range(5)
+ENTER_REMINDER_TEXT, ENTER_REMINDER_TIME, SELECT_REMINDER_TIME, SELECT_CUSTOM_TIME_OPTION, ENTER_CUSTOM_TIME = range(
+    5)
 
+ukraine_timezone = timezone('Europe/Kiev')
+scheduler = AsyncIOScheduler(timezone=ukraine_timezone)
+scheduler.start()
 
 
 def calculate_actual_time(selected_time):
-    now = datetime.now()  # Corrected line
-    
+    now = datetime.now()
+
     if selected_time == "Morning":
         reminder_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
     elif selected_time == "Afternoon":
@@ -22,14 +31,14 @@ def calculate_actual_time(selected_time):
     elif selected_time == "Evening":
         reminder_time = now.replace(hour=18, minute=0, second=0, microsecond=0)
     else:
-        # For "Custom Time", you can prompt the user to enter a specific time
+
         return None
-    
-    # If the calculated time is in the past, set it for the same time on the next day
+
     if reminder_time <= now:
-        reminder_time += timedelta(days=1)  # Corrected line
-    
+        reminder_time += timedelta(days=1)
+
     return reminder_time.strftime('%Y-%m-%d %H:%M:%S')
+
 
 logger = logging.getLogger(__name__)
 
@@ -44,52 +53,63 @@ async def send_welcome_menu(update: Update, context: CallbackContext, include_we
         welcome_message = "Welcome to EventEchoBot, press menu to choose options"
     else:
         welcome_message = "Select an option:"
-    
+
     keyboard = main_menu_keyboard()
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_message, reply_markup=keyboard)
 
+
 def main_menu_keyboard():
     keyboard = [[InlineKeyboardButton('Set a reminder', callback_data='m1')],
                 [InlineKeyboardButton('View reminder', callback_data='m2')],
-                [InlineKeyboardButton('Cancel reminder', callback_data='m3')],
-                [InlineKeyboardButton('About bot', callback_data='m4')]]
+                [InlineKeyboardButton('About bot', callback_data='m3')]]
     return InlineKeyboardMarkup(keyboard)
 
 
 def start(update: Update, context: CallbackContext):
-    context.job_queue.run_once(lambda _: asyncio.create_task(send_welcome_menu(update, context)), 0)
+    context.job_queue.run_once(lambda _: asyncio.create_task(
+        send_welcome_menu(update, context)), 0)
+
 
 async def main_menu_callback(update: Update, context: CallbackContext):
     query = update.callback_query
-    await query.answer()  # очікуєм корутину
+    await query.answer()
 
     callback_data = query.data
 
     if callback_data == 'm1':
-       set_reminder(update, context)
+        set_reminder(update, context)
     elif callback_data == 'm2':
-       await display_user_reminders(update, update.effective_user.id, context)
+        await display_user_reminders(update, update.effective_user.id, context)
     elif callback_data == 'm3':
-        pass  # обробка видалення
-    elif callback_data == 'm4':
-        await about(update, context) 
+        await about(update, context)
     else:
-        pass  # тут будуть помилки
+        pass
 
-    await query.edit_message_text(text="Main Menu:", reply_markup=main_menu_keyboard())  
+    await query.edit_message_text(text="Main Menu:", reply_markup=main_menu_keyboard())
 
 
-
-# Define the function to set a reminder
 async def set_reminder(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     await context.bot.send_message(chat_id=user_id, text="Please enter your reminder message:")
 
-    # Update the conversation state
     context.user_data['conversation_state'] = ENTER_REMINDER_TEXT
 
-# Handle user messages during the conversation
+    context.user_data['reminder_scheduled'] = True
+
+
+async def send_notification(user_id, reminder_message, context, reminder_id):
+    await context.bot.send_message(chat_id=user_id, text=f"Reminder: {reminder_message}")
+
+    reminder_collection = db[REMINDER_COLLECTION]
+    result = reminder_collection.delete_one({"_id": ObjectId(reminder_id)})
+    if result.deleted_count > 0:
+        print(f"Reminder with ID {reminder_id} deleted from the database")
+    else:
+        print(
+            f"Failed to delete reminder with ID {reminder_id} from the database")
+
+
 async def handle_user_message(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
 
@@ -97,44 +117,47 @@ async def handle_user_message(update: Update, context: CallbackContext):
         return
 
     if context.user_data['conversation_state'] == ENTER_REMINDER_TEXT:
+        if context.user_data['conversation_state'] == ENTER_REMINDER_TEXT:
+            if update.message.text.lower() == "quit":
+                await context.bot.send_message(chat_id=user_id, text="Reminder creation cancelled.")
+                await send_welcome_menu(update, context, include_welcome=False)
+                del context.user_data['conversation_state']
+                return
         context.user_data['reminder_message'] = update.message.text
-        
-        # Provide predefined time selection options
+
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton("Morning"), KeyboardButton("Afternoon")],
             [KeyboardButton("Evening"), KeyboardButton("Custom Time")]
         ], resize_keyboard=True, one_time_keyboard=True)
         await context.bot.send_message(chat_id=user_id, text="Please select the reminder time:", reply_markup=keyboard)
-        
+
         context.user_data['conversation_state'] = SELECT_REMINDER_TIME
     elif context.user_data['conversation_state'] == SELECT_REMINDER_TIME:
         selected_time = update.message.text
         if selected_time == "Custom Time":
             keyboard = ReplyKeyboardMarkup([
-                [KeyboardButton("Set by Hour"), KeyboardButton("Set by Minutes")]
+                [KeyboardButton("Set by Hour"),
+                 KeyboardButton("Set by Minutes")]
             ], resize_keyboard=True, one_time_keyboard=True)
             await context.bot.send_message(chat_id=user_id, text="Please select how to set the custom time:", reply_markup=keyboard)
             context.user_data['conversation_state'] = SELECT_CUSTOM_TIME_OPTION
         else:
-            reminder_time = calculate_actual_time(selected_time)  # Implement this function to calculate the reminder time
-            
-            # Store the reminder in the database
+            reminder_time = calculate_actual_time(selected_time)
+
             reminder_message = context.user_data['reminder_message']
             reminder_data = {
                 "user_id": user_id,
                 "reminder_message": reminder_message,
                 "reminder_time": reminder_time
             }
-            
-            # Insert the reminder data into the MongoDB collection
+
             db[REMINDER_COLLECTION].insert_one(reminder_data)
-            
+
             selected_time_message = f"Selected time: {selected_time}" if reminder_time else ""
             message = f"Setting a reminder for user {user_id}:\nReminder: {context.user_data['reminder_message']}\n{selected_time_message}"
             await context.bot.send_message(chat_id=user_id, text=message)
             await send_welcome_menu(update, context, include_welcome=False)
 
-            # Reset conversation state
             del context.user_data['conversation_state']
             del context.user_data['reminder_message']
     elif context.user_data['conversation_state'] == SELECT_CUSTOM_TIME_OPTION:
@@ -148,7 +171,7 @@ async def handle_user_message(update: Update, context: CallbackContext):
             context.user_data['custom_time_option'] = "minute"
             context.user_data['conversation_state'] = ENTER_CUSTOM_TIME
     elif context.user_data['conversation_state'] == ENTER_CUSTOM_TIME:
-        # Handle custom time entry based on the selected option (hour or minute)
+
         custom_time_input = update.message.text
         try:
             custom_time = int(custom_time_input)
@@ -156,15 +179,15 @@ async def handle_user_message(update: Update, context: CallbackContext):
                 reminder_time = datetime.now() + timedelta(hours=custom_time)
             elif context.user_data['custom_time_option'] == "minute":
                 reminder_time = datetime.now() + timedelta(minutes=custom_time)
-            
-            formatted_reminder_time = reminder_time.strftime('%Y-%m-%d %H:%M:%S')
+
+            formatted_reminder_time = reminder_time.strftime(
+                '%Y-%m-%d %H:%M:%S')
 
             selected_time = formatted_reminder_time
             message = f"Setting a reminder for user {user_id}:\nReminder: {context.user_data['reminder_message']}\nTime: {selected_time}"
             await context.bot.send_message(chat_id=user_id, text=message)
             await send_welcome_menu(update, context, include_welcome=False)
 
-            # Store the reminder in the database
             reminder_message = context.user_data['reminder_message']
             reminder_data = {
                 "user_id": user_id,
@@ -172,79 +195,100 @@ async def handle_user_message(update: Update, context: CallbackContext):
                 "reminder_time": formatted_reminder_time
             }
 
-            # Insert the reminder data into the MongoDB collection
             db[REMINDER_COLLECTION].insert_one(reminder_data)
 
-            # Reset conversation state
             del context.user_data['conversation_state']
             del context.user_data['reminder_message']
             del context.user_data['custom_time_option']
-
-            # Print the reminder_data for verification
-            print(reminder_data)
         except ValueError:
             await context.bot.send_message(chat_id=user_id, text="Invalid input. Please enter a valid number.")
 
 
-            
 async def about(update: Update, context: CallbackContext):
     about_message = "EventEchoBot is a reminder bot that helps you manage your tasks and events. You can set reminders, view upcoming events, and more."
-    user_id = update.effective_user.id  # Get the user ID
+    user_id = update.effective_user.id
     logger.info(f"User {user_id} requested information about the bot.")
-    
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=about_message)
-    
-    # After sending the about message, display the main menu without 
-            
 
-    
-    # After sending the about message, display the main menu without the welcome message
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=about_message)
+
     await send_welcome_menu(update, context, include_welcome=False)
 
-async def about(update: Update, context: CallbackContext):
-    about_message = "EventEchoBot is a reminder bot that helps you manage your tasks and events. You can set reminders, view upcoming events, and more."
-    user_id = update.effective_user.id  # Get the user ID
-    logger.info(f"User {user_id} requested information about the bot.")
-    
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=about_message)
-    
-    # After sending the about message, display the main menu without the welcome message
-    await send_welcome_menu(update, context, include_welcome=False)
-    
-def get_reminders_for_user(user_id):
-    reminders = db[REMINDER_COLLECTION].find({"user_id": user_id})
-    return list(reminders)
 
-async def display_user_reminders(update: Update,user_id, context):
-    reminders = get_reminders_for_user(user_id)
+async def get_reminders_for_user(user_id):
+    reminders_cursor = db[REMINDER_COLLECTION].find({"user_id": user_id})
+    reminders = [reminder for reminder in reminders_cursor]
+    return reminders
+
+
+async def display_user_reminders(update: Update, user_id, context):
+    reminders = await get_reminders_for_user(user_id)
 
     if not reminders:
         await context.bot.send_message(chat_id=user_id, text="You don't have any reminders.")
+        await send_welcome_menu(update, context, include_welcome=False)
         return
 
-    reminder_message = "Your reminders:\n"
     for reminder in reminders:
         reminder_time = reminder['reminder_time']
         reminder_msg = reminder['reminder_message']
-        reminder_message += f"- Reminder: {reminder_msg}\n  Time: {reminder_time}\n"
 
-    await context.bot.send_message(chat_id=user_id, text=reminder_message)
-    await send_welcome_menu(update, context, include_welcome=False)
+        reminder_timestamp = datetime.strptime(
+            reminder_time, '%Y-%m-%d %H:%M:%S')
+
+        if not scheduler.get_job(str(reminder['_id'])):
+            job_id = str(uuid.uuid4())
+
+            scheduler.add_job(
+                send_notification,
+                'date',
+                run_date=reminder_timestamp,
+                args=[user_id, reminder_msg, context, str(reminder['_id'])],
+                id=job_id
+            )
+
+        cancel_button = InlineKeyboardButton(
+            "Cancel", callback_data=f"cancel_{reminder['_id']}")
+        keyboard = InlineKeyboardMarkup([[cancel_button]])
+
+        reminder_message = f"Reminder: {reminder_msg}\nTime: {reminder_time}"
+        await context.bot.send_message(chat_id=user_id, text=reminder_message, reply_markup=keyboard)
+
+
+async def cancel_reminder(update: Update, context: CallbackContext):
+    query = update.callback_query
+    reminder_id = query.data.split("_")[1]
+
+    reminder_collection = db[REMINDER_COLLECTION]
+
+    result = reminder_collection.delete_one({"_id": ObjectId(reminder_id)})
+
+    if result.deleted_count > 0:
+        await query.answer(text="Reminder cancelled")
+    else:
+        await query.answer(text="Reminder not found")
+
+    await display_user_reminders(update, update.effective_user.id, context)
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(Token).build()
-    
+
     start_handler = CommandHandler('start', start)
     about_handler = CommandHandler('about', about)
     set_reminder_handler = CallbackQueryHandler(set_reminder, pattern='m1')
-    view_reminder_handler = CallbackQueryHandler(display_user_reminders,pattern='m2')
-    main_menu_handler = CallbackQueryHandler(main_menu_callback, pattern='m[1-4]')
-    message_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message)
+    view_reminder_handler = CallbackQueryHandler(
+        display_user_reminders, pattern='m2')
+    main_menu_handler = CallbackQueryHandler(
+        main_menu_callback, pattern='m[1-3]')
+    message_handler = MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_user_message)
+    cancel_reminder_handler = CallbackQueryHandler(
+        cancel_reminder, pattern=r'^cancel_')
 
     app.add_handler(start_handler)
     app.add_handler(about_handler)
     app.add_handler(set_reminder_handler)
     app.add_handler(main_menu_handler)
     app.add_handler(message_handler)
+    app.add_handler(cancel_reminder_handler)
 
     app.run_polling()
